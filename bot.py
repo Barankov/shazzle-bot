@@ -1,20 +1,15 @@
-"""
-Shazzle Telegram Bot для Render.com
-Бесплатный хостинг, никаких блокировок Telegram API.
-"""
 import os
 import base64
+import asyncio
 import requests
-from flask import Flask
-from threading import Thread
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# ═══════════════════════════════════════════════════
-# Ключи читаются из переменных окружения (Render → Environment)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
-# ═══════════════════════════════════════════════════
+RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", f"https://{RENDER_HOST}/webhook" if RENDER_HOST else "")
 
 SYSTEM_PROMPT = """Ты — Шаззл, эксперт по домашнему ремонту. Проанализируй фото и дай:
 
@@ -47,17 +42,8 @@ SYSTEM_PROMPT = """Ты — Шаззл, эксперт по домашнему �
 
 Правила: отвечай на русском. Если не уверен — скажи честно. Не давай опасных советов. Обращайся на 'ты'."""
 
-# Flask — чтобы Render считал сервис "живым" и не засыпал
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "🔧 Shazzle Bot is running!"
-
-
 def analyze_photo(photo_bytes: bytes) -> str:
     base64_image = base64.b64encode(photo_bytes).decode("utf-8")
-
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -81,50 +67,55 @@ def analyze_photo(photo_bytes: bytes) -> str:
         },
         timeout=60
     )
-
     data = response.json()
     return data["choices"][0]["message"]["content"]
-
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_message(chat_id, "🔍 Анализирую фото...")
-
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     photo_bytes = await file.download_as_bytearray()
-
     try:
-        diagnosis = analyze_photo(bytes(photo_bytes))
+        diagnosis = await asyncio.to_thread(analyze_photo, bytes(photo_bytes))
         await context.bot.send_message(chat_id, diagnosis, parse_mode="Markdown")
     except Exception as e:
-        await context.bot.send_message(chat_id, f"❌ Ошибка: {str(e)}\n\nПопробуй ещё раз или напиши текстом.")
-
+        await context.bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📸 Пришли мне фото сломанной вещи, и я скажу, что с ней не так и как починить.\n\n"
-        "Или напиши, что сломалось — попробую помочь советом."
+        "📸 Пришли мне фото сломанной вещи, и я скажу, что с ней не так и как починить."
     )
 
+async def health(request):
+    return web.Response(text="🔧 Shazzle Bot is running!")
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+async def webhook(request):
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return web.Response(text="OK")
 
+application = Application.builder().token(TELEGRAM_TOKEN).build()
+application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-def run_bot():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+async def on_startup(app):
+    await application.initialize()
+    await application.start()
+    if WEBHOOK_URL:
+        await application.bot.set_webhook(WEBHOOK_URL)
 
-    print("🚀 Shazzle Bot запущен на Render!")
-    print("Пришли фото в Telegram — получи диагноз.")
-    application.run_polling()
+async def on_cleanup(app):
+    await application.stop()
+    await application.shutdown()
 
+app = web.Application()
+app.router.add_get("/", health)
+app.router.add_post("/webhook", webhook)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
-    # Flask в отдельном потоке (для keep-alive)
-    Thread(target=run_flask).start()
-    # Бот в основном потоке
-    run_bot()
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
